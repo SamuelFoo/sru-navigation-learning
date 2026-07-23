@@ -16,7 +16,11 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from rsl_rl.networks.sru_memory import LSTM_SRU, CrossAttentionFuseModule
+from rsl_rl.networks.sru_memory import (
+    LSTM_SRU,
+    CrossAttentionFuseModule,
+    CrossModalFuseModule,
+)
 from rsl_rl.utils import unpad_trajectories
 
 
@@ -63,6 +67,8 @@ class ActorCriticSRU(nn.Module):
         rnn_num_layers: int = 1,
         time_embed_dim: int = 8,
         num_cameras: int = 1,
+        fusion_view_dims: Optional[list[tuple[int, int, int]]] = None,
+        fusion_num_heads: int = 4,
         **kwargs,
     ):
         if kwargs:
@@ -81,18 +87,40 @@ class ActorCriticSRU(nn.Module):
         self.height_input_dims = height_input_dims
         self.num_cameras = num_cameras
 
+        # Fusion mode: replaces the single/dual-camera image path with two heterogeneous
+        # latents (fusion_view_dims = [(C,H,W)_depth, (C,H,W)_lidar]) fused by cross-attention.
+        self.fusion = fusion_view_dims is not None
+        self.fusion_view_dims = (
+            [tuple(int(x) for x in d) for d in fusion_view_dims] if self.fusion else None
+        )
+
         # Compute the total number of features from image and height inputs.
         self.num_image_features = image_input_dims[0] * image_input_dims[1] * image_input_dims[2]
         self.num_height_features = height_input_dims[0] * height_input_dims[1] * height_input_dims[2]
+
+        if self.fusion:
+            self.view_feature_sizes = [c * h * w for (c, h, w) in self.fusion_view_dims]
+            self.total_image_features = sum(self.view_feature_sizes)
+            # Every view shares the channel/embedding dim (the attention token dim).
+            fusion_dims = {c for (c, _, _) in self.fusion_view_dims}
+            assert len(fusion_dims) == 1, (
+                f"fusion views must share channel dim, got {self.fusion_view_dims}"
+            )
+            assert image_input_dims[0] == self.fusion_view_dims[0][0], (
+                "image_input_dims[0] must equal the shared fusion channel dim"
+            )
+        else:
+            self.view_feature_sizes = None
+            self.total_image_features = self.num_image_features * self.num_cameras
 
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
 
         # For actor: proprioceptive data + image data
         # For critic: proprioceptive data + height data + image data + time data
-        self.actor_proprioceptive_input_dim = num_actor_obs - self.num_image_features * self.num_cameras
+        self.actor_proprioceptive_input_dim = num_actor_obs - self.total_image_features
         self.critic_proprioceptive_input_dim = (
-            num_critic_obs - self.num_height_features - self.num_image_features * self.num_cameras - 1
+            num_critic_obs - self.num_height_features - self.total_image_features - 1
         )
 
         assert self.actor_proprioceptive_input_dim == self.critic_proprioceptive_input_dim, (
@@ -107,23 +135,39 @@ class ActorCriticSRU(nn.Module):
 
         # Attention modules (applied in batch, outside RNN loop)
         # spatial_dims = (D, H, W) where D=num_cameras for image, D=1 for height
-        self.attn_image_net = CrossAttentionFuseModule(
-            image_dim=image_input_dims[0],
-            info_dim=self.actor_proprioceptive_input_dim,
-            num_heads=4,
-            spatial_dims=(num_cameras, image_input_dims[1], image_input_dims[2]),
-        )
+        if self.fusion:
+            # Per-view token counts (H*W of each latent grid), in order [depth, lidar].
+            view_sizes = [h * w for (_, h, w) in self.fusion_view_dims]
+            self.attn_image_net = CrossModalFuseModule(
+                image_dim=image_input_dims[0],
+                info_dim=self.actor_proprioceptive_input_dim,
+                num_heads=fusion_num_heads,
+                view_sizes=view_sizes,
+            )
+            self.attn_critic_image_net = CrossModalFuseModule(
+                image_dim=image_input_dims[0],
+                info_dim=self.critic_proprioceptive_input_dim,
+                num_heads=fusion_num_heads,
+                view_sizes=view_sizes,
+            )
+        else:
+            self.attn_image_net = CrossAttentionFuseModule(
+                image_dim=image_input_dims[0],
+                info_dim=self.actor_proprioceptive_input_dim,
+                num_heads=4,
+                spatial_dims=(num_cameras, image_input_dims[1], image_input_dims[2]),
+            )
+            self.attn_critic_image_net = CrossAttentionFuseModule(
+                image_dim=image_input_dims[0],
+                info_dim=self.critic_proprioceptive_input_dim,
+                num_heads=4,
+                spatial_dims=(num_cameras, image_input_dims[1], image_input_dims[2]),
+            )
         self.attn_height_net = CrossAttentionFuseModule(
             image_dim=height_input_dims[0],
             info_dim=self.critic_proprioceptive_input_dim,
             num_heads=4,
             spatial_dims=(1, height_input_dims[1], height_input_dims[2]),
-        )
-        self.attn_critic_image_net = CrossAttentionFuseModule(
-            image_dim=image_input_dims[0],
-            info_dim=self.critic_proprioceptive_input_dim,
-            num_heads=4,
-            spatial_dims=(num_cameras, image_input_dims[1], image_input_dims[2]),
         )
 
         # RNN memory modules (plain LSTM_SRU without attention)
@@ -232,6 +276,17 @@ class ActorCriticSRU(nn.Module):
         Returns:
             List of reshaped image tensors.
         """
+        if self.fusion:
+            # The trailing `total_image_features` are the concatenated per-view latents,
+            # in the same order as `fusion_view_dims` (depth, then lidar).
+            views: list[torch.Tensor] = []
+            offset = self.total_image_features
+            for (c, h, w), size in zip(self.fusion_view_dims, self.view_feature_sizes):
+                start = observations.shape[-1] - offset
+                chunk = observations[..., start : start + size]
+                views.append(chunk.reshape(-1, c, h, w))
+                offset -= size
+            return views
         if self.num_cameras == 2:
             image_obs_front = observations[..., -self.num_image_features * 2 : -self.num_image_features]
             image_obs_back = observations[..., -self.num_image_features :]
@@ -262,13 +317,13 @@ class ActorCriticSRU(nn.Module):
         batch_mode = masks is not None
 
         # Split observations into proprioceptive and image parts
-        other_obs = observations[..., : -self.num_image_features * self.num_cameras]
+        other_obs = observations[..., : -self.total_image_features]
         image_list = self._extract_image_observations(observations)
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
-        # Stack images if multiple cameras, otherwise use single image
-        if self.num_cameras == 2:
-            image_input = image_list  # List of tensors for multi-camera
+        # Fusion / multi-camera pass a list of views; single-camera passes one tensor.
+        if self.fusion or self.num_cameras == 2:
+            image_input = image_list  # List of tensors (heterogeneous views ok)
         else:
             image_input = image_list[0]  # Single tensor
 
@@ -306,8 +361,8 @@ class ActorCriticSRU(nn.Module):
         batch_mode = masks is not None
 
         # Calculate offsets for observation slicing
-        time_offset = self.num_height_features + self.num_image_features * self.num_cameras + 1
-        height_start = self.num_image_features * self.num_cameras
+        time_offset = self.num_height_features + self.total_image_features + 1
+        height_start = self.total_image_features
 
         # Split observations into proprioceptive, time, height, and image parts
         other_obs = observations[..., :-time_offset]
@@ -319,9 +374,9 @@ class ActorCriticSRU(nn.Module):
         other_obs = other_obs.reshape(-1, self.critic_proprioceptive_input_dim)
         height_obs = height_obs.reshape(-1, *self.height_input_dims)
 
-        # Stack images if multiple cameras, otherwise use single image
-        if self.num_cameras == 2:
-            image_input = image_list  # List of tensors for multi-camera
+        # Fusion / multi-camera pass a list of views; single-camera passes one tensor.
+        if self.fusion or self.num_cameras == 2:
+            image_input = image_list  # List of tensors (heterogeneous views ok)
         else:
             image_input = image_list[0]  # Single tensor
 
@@ -411,6 +466,13 @@ class ActorCriticSRU(nn.Module):
         """
         import os
 
+        if self.fusion:
+            raise NotImplementedError(
+                "JIT export for the geometric depth+LiDAR fusion policy is not yet "
+                "implemented; train/evaluate in-process. A dedicated fusion exporter is a "
+                "follow-up (mirror _ActorCriticSRUExporterDualCam with per-view dims)."
+            )
+
         # Select optimized exporter based on camera count
         if self.num_cameras == 2:
             exporter = _ActorCriticSRUExporterDualCam(
@@ -471,6 +533,13 @@ class ActorCriticSRU(nn.Module):
             normalizer: Optional normalizer module for observations.
         """
         import os
+
+        if self.fusion:
+            raise NotImplementedError(
+                "ONNX export for the geometric depth+LiDAR fusion policy is not yet "
+                "implemented; train/evaluate in-process. A dedicated fusion exporter is a "
+                "follow-up (mirror _ActorCriticSRUONNXExporterDualCam with per-view dims)."
+            )
 
         rnn = self.memory_a.rnn
 

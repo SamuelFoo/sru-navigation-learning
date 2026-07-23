@@ -5,10 +5,12 @@
 """SRU memory modules including LSTM variants and attention mechanisms."""
 
 from .attention import CrossAttentionFuseModule
+from .cross_modal_fusion import CrossModalFuseModule
 from .lstm_sru import LSTM_SRU, LSTMSRUCell
 
 __all__ = [
     "LSTM_SRU",
     "LSTMSRUCell",
     "CrossAttentionFuseModule",
+    "CrossModalFuseModule",
 ]
