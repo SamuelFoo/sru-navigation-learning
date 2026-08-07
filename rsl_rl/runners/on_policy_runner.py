@@ -28,6 +28,17 @@ class OnPolicyRunner:
     type and adapts behavior accordingly (e.g., MDPO uses two actor-critics).
     """
 
+    @staticmethod
+    def _split_observations(observations, extras=None):
+        """Return policy and critic tensors across old and new Isaac Lab APIs."""
+        if hasattr(observations, "keys") and "policy" in observations:
+            policy_obs = observations["policy"]
+            return policy_obs, observations.get("critic", policy_obs)
+
+        extras = extras or {}
+        extra_observations = extras.get("observations", {})
+        return observations, extra_observations.get("critic", observations)
+
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
@@ -38,12 +49,14 @@ class OnPolicyRunner:
         # Video recording (initialized lazily, enabled via set_video_recording)
         self.video_recorder: VideoRecorder | None = None
 
-        obs, extras = self.env.get_observations()
-        num_obs = obs.shape[1]
-        if "critic" in extras["observations"]:
-            num_critic_obs = extras["observations"]["critic"].shape[1]
+        observation_result = self.env.get_observations()
+        if isinstance(observation_result, tuple):
+            observations, extras = observation_result
         else:
-            num_critic_obs = num_obs
+            observations, extras = observation_result, {}
+        obs, critic_obs = self._split_observations(observations, extras)
+        num_obs = obs.shape[1]
+        num_critic_obs = critic_obs.shape[1]
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
         print("num obs", num_obs)
         print("num critic obs", num_critic_obs)
@@ -149,8 +162,12 @@ class OnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-        obs, extras = self.env.get_observations()
-        critic_obs = extras["observations"].get("critic", obs)
+        observation_result = self.env.get_observations()
+        if isinstance(observation_result, tuple):
+            observations, extras = observation_result
+        else:
+            observations, extras = observation_result, {}
+        obs, critic_obs = self._split_observations(observations, extras)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         self.train_mode()
 
@@ -181,7 +198,8 @@ class OnPolicyRunner:
             with torch.no_grad():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
-                    obs, rewards, dones, infos = self.env.step(actions)
+                    observations, rewards, dones, infos = self.env.step(actions)
+                    obs, critic_obs = self._split_observations(observations, infos)
 
                     # Capture video frame if recording
                     # Continue capturing until video_length is reached
@@ -193,10 +211,7 @@ class OnPolicyRunner:
                         rewards = rewards + reward_shifting_value
 
                     obs = self.obs_normalizer(obs)
-                    if "critic" in infos["observations"]:
-                        critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
-                    else:
-                        critic_obs = obs
+                    critic_obs = self.critic_obs_normalizer(critic_obs)
                     obs, critic_obs, rewards, dones = (
                         obs.to(self.device),
                         critic_obs.to(self.device),
