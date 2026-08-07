@@ -27,18 +27,27 @@ class WandbSummaryWriter(SummaryWriter):
         # Try to get entity from environment, but make it optional
         entity = os.environ.get("WANDB_USERNAME", None)
 
+        # A resume reuses the log directory, so the run id recorded there lets the
+        # continuation append to the original W&B run instead of starting a new one.
+        self._run_id_file = os.path.join(log_dir, "wandb_run_id.txt")
+        resume_id = self._read_run_id()
+        init_kwargs = {"project": project}
+        if resume_id:
+            print(f"Resuming W&B run {resume_id}")
+            init_kwargs.update(id=resume_id, resume="allow")
+
         # Try to initialize with entity first, fall back to default if permission denied
         try:
             if entity:
                 print(f"Logging to project {project} with entity {entity}")
-                wandb.init(project=project, entity=entity)
+                wandb.init(entity=entity, **init_kwargs)
             else:
                 print(f"Logging to project {project} (using default entity from API key)")
-                wandb.init(project=project)
+                wandb.init(**init_kwargs)
         except wandb.errors.CommError as e:
             if "403" in str(e) or "permission denied" in str(e).lower():
                 print(f"Permission denied for entity {entity}, trying without entity specification...")
-                wandb.init(project=project)
+                wandb.init(**init_kwargs)
             else:
                 raise
 
@@ -52,7 +61,23 @@ class WandbSummaryWriter(SummaryWriter):
         # Set wandb run name to match the log directory name
         wandb.run.name = run_name
 
+        if not resume_id:
+            self._write_run_id(wandb.run.id)
+
         wandb.log({"log_dir": run_name})
+
+    def _read_run_id(self) -> str | None:
+        """Return the W&B run id previously recorded in the log directory."""
+        if not os.path.isfile(self._run_id_file):
+            return None
+        with open(self._run_id_file) as handle:
+            return handle.read().strip() or None
+
+    def _write_run_id(self, run_id: str) -> None:
+        """Record the W&B run id so a later resume can append to this run."""
+        os.makedirs(os.path.dirname(self._run_id_file), exist_ok=True)
+        with open(self._run_id_file, "w") as handle:
+            handle.write(run_id)
 
     def store_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
         wandb.config.update({"runner_cfg": runner_cfg})

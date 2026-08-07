@@ -91,10 +91,32 @@ class OnPolicyRunner:
         # Log
         self.log_dir = log_dir
         self.writer = None
+        # Set for real in learn(); pre-declared so save() works outside the training loop.
+        self.logger_type = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+
+    def remaining_iterations(self, max_iterations: int) -> int:
+        """Iterations still owed to reach ``max_iterations`` in total.
+
+        :meth:`learn` counts from the restored iteration counter, so a resumed run
+        must request the remainder; passing the full budget would overshoot by
+        whatever the checkpoint had already trained.
+        """
+        remaining = max_iterations - self.current_learning_iteration
+        if remaining <= 0:
+            raise ValueError(
+                f"Checkpoint is already at iteration {self.current_learning_iteration}, which "
+                f"meets max_iterations={max_iterations}; raise max_iterations to train further."
+            )
+        if self.current_learning_iteration:
+            print(
+                f"[INFO] Resuming at iteration {self.current_learning_iteration}; training "
+                f"{remaining} more to reach {max_iterations}."
+            )
+        return remaining
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         """Run the training loop.
@@ -334,12 +356,56 @@ class OnPolicyRunner:
         )
         print(log_string)
 
+    def _capture_rng_state(self) -> dict:
+        """Capture the torch RNG streams.
+
+        Only torch is captured: action sampling, dropout masks, episode-length
+        randomization and minibatch shuffling are the loop's sole RNG consumers and
+        all draw from torch. Every entry is a tensor, which keeps the
+        ``weights_only=True`` read path in :meth:`load` intact.
+        """
+        rng_state = {"torch": torch.get_rng_state()}
+        if torch.cuda.is_available():
+            rng_state["cuda"] = torch.cuda.get_rng_state_all()
+        return rng_state
+
+    def _restore_rng_state(self, rng_state: dict) -> None:
+        """Restore RNG streams captured by :meth:`_capture_rng_state`."""
+        torch.set_rng_state(rng_state["torch"].cpu().to(torch.uint8))
+        cuda_state = rng_state.get("cuda")
+        if cuda_state is None or not torch.cuda.is_available():
+            return
+        # Resuming onto a different GPU count cannot restore per-device streams.
+        if len(cuda_state) != torch.cuda.device_count():
+            print(
+                f"[WARN] Checkpoint holds {len(cuda_state)} CUDA RNG states but this run has "
+                f"{torch.cuda.device_count()} device(s); leaving CUDA RNG unrestored."
+            )
+            return
+        torch.cuda.set_rng_state_all([state.cpu().to(torch.uint8) for state in cuda_state])
+
+    def _env_step_counter(self) -> int | None:
+        """Read the environment's global step counter, if it exposes one."""
+        env = getattr(self.env, "unwrapped", self.env)
+        counter = getattr(env, "common_step_counter", None)
+        return None if counter is None else int(counter)
+
+    def _set_env_step_counter(self, value: int) -> None:
+        """Restore the environment's global step counter so curricula stay in phase."""
+        env = getattr(self.env, "unwrapped", self.env)
+        if hasattr(env, "common_step_counter"):
+            env.common_step_counter = int(value)
+
     def save(self, path, infos=None):
-        """Save the model checkpoint."""
+        """Save the full training state required to resume."""
         if self.is_mdpo:
+            # MDPO trains two independent actor-critics; both halves and both
+            # optimizers must be persisted or a resume silently restarts one of them.
             saved_dict = {
                 "model_state_dict": self.alg.actor_critic_1.state_dict(),
                 "optimizer_state_dict": self.alg.optimizer_1.state_dict(),
+                "model_2_state_dict": self.alg.actor_critic_2.state_dict(),
+                "optimizer_2_state_dict": self.alg.optimizer_2.state_dict(),
                 "iter": self.current_learning_iteration,
                 "infos": infos,
             }
@@ -353,19 +419,29 @@ class OnPolicyRunner:
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
+        saved_dict["rng_state"] = self._capture_rng_state()
+        env_step_counter = self._env_step_counter()
+        if env_step_counter is not None:
+            saved_dict["env_step_counter"] = env_step_counter
         torch.save(saved_dict, path)
 
         if self.logger_type in ["neptune", "wandb"]:
             self.writer.save_model(path, self.current_learning_iteration)
 
     def load(self, path, load_optimizer=True):
-        """Load a model checkpoint."""
+        """Load a checkpoint.
+
+        ``load_optimizer`` distinguishes a training resume from a weights-only load.
+        A resume additionally restores optimizer moments, the RNG streams and the
+        environment step counter; evaluation and export want none of those.
+        """
         loaded_dict = torch.load(path, weights_only=True)
         if self.is_mdpo:
             self.alg.actor_critic_1.load_state_dict(loaded_dict["model_state_dict"], strict=True)
-            self.alg.actor_critic_2.load_state_dict(loaded_dict["model_state_dict"], strict=True)
+            self.alg.actor_critic_2.load_state_dict(loaded_dict["model_2_state_dict"], strict=True)
             if load_optimizer:
                 self.alg.optimizer_1.load_state_dict(loaded_dict["optimizer_state_dict"])
+                self.alg.optimizer_2.load_state_dict(loaded_dict["optimizer_2_state_dict"])
         else:
             self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"], strict=True)
             if load_optimizer:
@@ -373,6 +449,10 @@ class OnPolicyRunner:
         if self.empirical_normalization:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
             self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
+        if load_optimizer:
+            self._restore_rng_state(loaded_dict["rng_state"])
+            if "env_step_counter" in loaded_dict:
+                self._set_env_step_counter(loaded_dict["env_step_counter"])
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
