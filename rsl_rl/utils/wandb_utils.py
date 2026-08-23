@@ -80,10 +80,13 @@ class WandbSummaryWriter(SummaryWriter):
             handle.write(run_id)
 
     def store_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
-        wandb.config.update({"runner_cfg": runner_cfg})
-        wandb.config.update({"policy_cfg": policy_cfg})
-        wandb.config.update({"alg_cfg": alg_cfg})
-        wandb.config.update({"env_cfg": asdict(env_cfg)})
+        # A resume reattaches to a run whose config is already populated, and the
+        # continuation's values legitimately differ (e.g. the remaining iteration
+        # budget), so overwriting has to be permitted or W&B raises ConfigError.
+        wandb.config.update({"runner_cfg": runner_cfg}, allow_val_change=True)
+        wandb.config.update({"policy_cfg": policy_cfg}, allow_val_change=True)
+        wandb.config.update({"alg_cfg": alg_cfg}, allow_val_change=True)
+        wandb.config.update({"env_cfg": asdict(env_cfg)}, allow_val_change=True)
 
     def _map_path(self, path):
         if path in self.name_map:

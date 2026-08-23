@@ -108,15 +108,15 @@ class OnPolicyRunner:
         self.logger_type = None
         self.tot_timesteps = 0
         self.tot_time = 0
+        # Also the number of completed learning iterations.
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
     def remaining_iterations(self, max_iterations: int) -> int:
         """Iterations still owed to reach ``max_iterations`` in total.
 
-        :meth:`learn` counts from the restored iteration counter, so a resumed run
-        must request the remainder; passing the full budget would overshoot by
-        whatever the checkpoint had already trained.
+        ``current_learning_iteration`` counts completed updates, so subtracting it
+        from the total budget is exact for both fresh and resumed runs.
         """
         remaining = max_iterations - self.current_learning_iteration
         if remaining <= 0:
@@ -124,10 +124,10 @@ class OnPolicyRunner:
                 f"Checkpoint is already at iteration {self.current_learning_iteration}, which "
                 f"meets max_iterations={max_iterations}; raise max_iterations to train further."
             )
-        if self.current_learning_iteration:
+        if self.current_learning_iteration > 0:
             print(
-                f"[INFO] Resuming at iteration {self.current_learning_iteration}; training "
-                f"{remaining} more to reach {max_iterations}."
+                f"[INFO] Resuming with {self.current_learning_iteration} completed iterations; "
+                f"training {remaining} more to reach {max_iterations}."
             )
         return remaining
 
@@ -259,7 +259,7 @@ class OnPolicyRunner:
 
             stop = time.time()
             learn_time = stop - start
-            self.current_learning_iteration = it
+            self.current_learning_iteration = it + 1
 
             # reset dropout masks
             self.alg.reset_dropout_masks()
@@ -271,8 +271,13 @@ class OnPolicyRunner:
                 if self.video_recorder and self.video_recorder.is_recording and self.video_recorder.is_complete():
                     self.video_recorder.log_video(self.writer, it, self.logger_type)
 
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            if self.current_learning_iteration % self.save_interval == 0:
+                self.save(
+                    os.path.join(
+                        self.log_dir,
+                        f"model_{self.current_learning_iteration}.pt",
+                    )
+                )
             ep_infos.clear()
             if it == start_iter:
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
