@@ -131,6 +131,12 @@ class OnPolicyRunner:
             )
         return remaining
 
+    def close(self) -> None:
+        """Finalize the active summary writer, if any."""
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         """Run the training loop.
 

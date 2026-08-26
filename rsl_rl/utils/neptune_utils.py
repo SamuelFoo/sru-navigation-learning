@@ -78,7 +78,8 @@ class NeptuneSummaryWriter(SummaryWriter):
         )
         self.neptune_logger.run[self._map_path(tag)].log(scalar_value, step=global_step)
 
-    def stop(self):
+    def close(self):
+        super().close()
         self.neptune_logger.run.stop()
 
     def log_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):

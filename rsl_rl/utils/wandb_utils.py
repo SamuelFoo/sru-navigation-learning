@@ -104,7 +104,8 @@ class WandbSummaryWriter(SummaryWriter):
         )
         wandb.log({self._map_path(tag): scalar_value}, step=global_step)
 
-    def stop(self):
+    def close(self):
+        super().close()
         wandb.finish()
 
     def log_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
