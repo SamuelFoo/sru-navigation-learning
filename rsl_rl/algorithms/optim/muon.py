@@ -38,7 +38,9 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
         update = update.view(len(update), -1)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
-    return update
+    # Reshape back to the parameter shape: conv filters were flattened to 2D
+    # above, and a 1x1 conv [C,K,1,1] would otherwise broadcast at p.add_.
+    return update.reshape(grad.shape)
 
 
 class Muon(torch.optim.Optimizer):
