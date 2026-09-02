@@ -6,11 +6,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import random
 import statistics
 import time
 from collections import deque
 
+import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
@@ -39,6 +42,27 @@ class OnPolicyRunner:
         extra_observations = extras.get("observations", {})
         return observations, extra_observations.get("critic", observations)
 
+    @staticmethod
+    def _state_sha256(module: torch.nn.Module) -> str:
+        """Hash the pristine tensor state of a policy module deterministically."""
+        digest = hashlib.sha256()
+        for name, tensor in sorted(module.state_dict().items()):
+            value = tensor.detach().contiguous().cpu()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(str(tuple(value.shape)).encode("ascii"))
+            digest.update(value.numpy().tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _seed_policy_initialization(seed: int) -> None:
+        """Seed policy construction independently of environment initialization."""
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
@@ -57,6 +81,9 @@ class OnPolicyRunner:
         obs, critic_obs = self._split_observations(observations, extras)
         num_obs = obs.shape[1]
         num_critic_obs = critic_obs.shape[1]
+        self.policy_seed = int(train_cfg.get("policy_seed", train_cfg.get("seed", 0)))
+        self._seed_policy_initialization(self.policy_seed)
+        print(f"[INFO] Policy initialization seed: {self.policy_seed}")
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
         print("num obs", num_obs)
         print("num critic obs", num_critic_obs)
@@ -74,13 +101,21 @@ class OnPolicyRunner:
             actor_critic_2: ActorCritic | ActorCriticRecurrent | ActorCriticSRU = actor_critic_class(
                 num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
             ).to(self.device)
+            self.initial_policy_sha256 = {
+                "actor_critic_1": self._state_sha256(actor_critic_1),
+                "actor_critic_2": self._state_sha256(actor_critic_2),
+            }
             self.alg = alg_class(actor_critic_1, actor_critic_2, device=self.device, **self.alg_cfg)
         else:
             # Standard algorithms use one actor-critic
             actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticSRU = actor_critic_class(
                 num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
             ).to(self.device)
+            self.initial_policy_sha256 = {
+                "actor_critic": self._state_sha256(actor_critic),
+            }
             self.alg = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+        print(f"[INFO] Pristine policy SHA-256: {self.initial_policy_sha256}")
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
