@@ -445,6 +445,29 @@ class OnPolicyRunner:
             rng_state["cuda"] = torch.cuda.get_rng_state_all()
         return rng_state
 
+    def _restore_episode_lengths(self, episode_length_buf) -> None:
+        """Restore per-environment episode ages so a resume continues mid-episode.
+
+        Without this every environment resumes at age zero and they time out
+        together, re-introducing the synchronization ``init_at_random_ep_len``
+        exists to break.
+
+        Raises when the environment count differs: a true resume cannot change
+        it without invalidating the optimizer moments, RNG state and step
+        counter that are restored alongside.
+        """
+        current = self.env.episode_length_buf
+        if episode_length_buf.shape != current.shape:
+            raise ValueError(
+                f"Checkpoint holds {tuple(episode_length_buf.shape)} episode ages but this "
+                f"run has {tuple(current.shape)} environments. A true resume cannot change "
+                "the environment count: the optimizer moments, RNG state and step counter "
+                "all assume the original one."
+            )
+        self.env.episode_length_buf = episode_length_buf.to(
+            device=current.device, dtype=current.dtype
+        )
+
     def _restore_rng_state(self, rng_state: dict) -> None:
         """Restore RNG streams captured by :meth:`_capture_rng_state`."""
         torch.set_rng_state(rng_state["torch"].cpu().to(torch.uint8))
@@ -496,6 +519,7 @@ class OnPolicyRunner:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
         saved_dict["rng_state"] = self._capture_rng_state()
+        saved_dict["episode_length_buf"] = self.env.episode_length_buf.detach().cpu()
         env_step_counter = self._env_step_counter()
         if env_step_counter is not None:
             saved_dict["env_step_counter"] = env_step_counter
@@ -504,12 +528,15 @@ class OnPolicyRunner:
         if self.logger_type in ["neptune", "wandb"]:
             self.writer.save_model(path, self.current_learning_iteration)
 
-    def load(self, path, load_optimizer=True):
+    def load(self, path, load_optimizer=True, load_episode_lengths=False):
         """Load a checkpoint.
 
         ``load_optimizer`` distinguishes a training resume from a weights-only load.
         A resume additionally restores optimizer moments, the RNG streams and the
         environment step counter; evaluation and export want none of those.
+
+        ``load_episode_lengths`` is opt-in because only a true resume continues the
+        interrupted episodes. A warm start and evaluation both want fresh ones.
         """
         loaded_dict = torch.load(path, weights_only=True)
         if self.is_mdpo:
@@ -529,6 +556,8 @@ class OnPolicyRunner:
             self._restore_rng_state(loaded_dict["rng_state"])
             if "env_step_counter" in loaded_dict:
                 self._set_env_step_counter(loaded_dict["env_step_counter"])
+        if load_episode_lengths and "episode_length_buf" in loaded_dict:
+            self._restore_episode_lengths(loaded_dict["episode_length_buf"])
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
