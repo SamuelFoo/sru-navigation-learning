@@ -71,7 +71,11 @@ def test_build_and_forward():
     n_depth = DEPTH[0] * DEPTH[1] * DEPTH[2] // DEPTH[0]  # H*W tokens
     n_lidar = LIDAR[1] * LIDAR[2]
     assert attn["view_sizes"] == [n_depth, n_lidar]
-    assert attn["cross_attn"].shape == (B, n_depth + n_lidar)
+    assert attn["cross_attn_heads"].shape == (
+        B,
+        model.attn_image_net.num_heads,
+        n_depth + n_lidar,
+    )
 
 
 if __name__ == "__main__":

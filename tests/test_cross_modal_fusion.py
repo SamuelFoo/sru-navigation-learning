@@ -64,11 +64,16 @@ def test_return_attn_weights():
     sa = attn["self_attn"]
     assert sa.shape == (2, n_total, n_total)
     assert torch.allclose(sa.sum(dim=-1), torch.ones(2, n_total), atol=1e-4)
-    # Cross-attention (proprio query) is a distribution over all tokens.
-    ca = attn["cross_attn"]
-    assert ca.shape == (2, n_total)
-    assert torch.allclose(ca.sum(dim=-1), torch.ones(2), atol=1e-4)
+    # Cross-attention (proprio query) is a per-head distribution over all tokens.
+    ca_heads = attn["cross_attn_heads"]
+    assert ca_heads.shape == (2, module.num_heads, n_total)
+    assert torch.allclose(
+        ca_heads.sum(dim=-1),
+        torch.ones(2, module.num_heads),
+        atol=1e-4,
+    )
     # The depth-vs-lidar mass split the viz relies on.
+    ca = ca_heads.mean(dim=1)
     depth_mass = ca[:, :N_DEPTH].sum(dim=-1)
     lidar_mass = ca[:, N_DEPTH:].sum(dim=-1)
     assert torch.allclose(depth_mass + lidar_mass, torch.ones(2), atol=1e-4)

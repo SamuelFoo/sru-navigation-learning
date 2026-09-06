@@ -101,14 +101,17 @@ class CrossModalFuseModule(nn.Module):
 
         # --- Cross-attention with proprio query ---
         query = self.info_proj(info).unsqueeze(1)            # [B, 1, C]
-        ca, cross_w = self.cross_attn(query, x, x, need_weights=return_attn)
+        ca, cross_w = self.cross_attn(
+            query, x, x, need_weights=return_attn, average_attn_weights=False
+        )
         out = ca.squeeze(1)                                  # [B, C]
 
         if not return_attn:
             return out
+        cross_heads = cross_w.squeeze(2).detach() if cross_w is not None else None
         attn_info = {
             "self_attn": attn.mean(dim=1).detach(),          # [B, N, N]
-            "cross_attn": cross_w.squeeze(1).detach() if cross_w is not None else None,
+            "cross_attn_heads": cross_heads,
             "view_sizes": list(self.view_sizes),
         }
         return out, attn_info
