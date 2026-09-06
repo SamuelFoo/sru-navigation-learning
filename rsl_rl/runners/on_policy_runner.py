@@ -172,11 +172,21 @@ class OnPolicyRunner:
             self.writer.close()
             self.writer = None
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+    def learn(
+        self,
+        num_learning_iterations: int,
+        lr_schedule_iterations: int,
+        init_at_random_ep_len: bool = False,
+    ):
         """Run the training loop.
 
         Args:
             num_learning_iterations: Number of training iterations.
+            lr_schedule_iterations: Total horizon parameterizing the LR decay. Pass
+                the full-run budget even for a short probe, otherwise the schedule
+                is compressed into the probe and its learning curve cannot be
+                compared with a full run. This does not bound the loop;
+                num_learning_iterations does.
             init_at_random_ep_len: If True, randomize initial episode lengths.
         """
         # initialize writer
@@ -223,6 +233,11 @@ class OnPolicyRunner:
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        if lr_schedule_iterations < tot_iter:
+            raise ValueError(
+                f"lr_schedule_iterations={lr_schedule_iterations} ends before this "
+                f"invocation's last completed iteration {tot_iter}."
+            )
 
         for it in range(start_iter, tot_iter):
             start = time.time()
@@ -291,7 +306,7 @@ class OnPolicyRunner:
                 self.alg.update_dropout_masks()
 
             # Update returns different values based on algorithm type
-            update_result = self.alg.update(it, tot_iter)
+            update_result = self.alg.update(it, lr_schedule_iterations)
             if self.is_mdpo:
                 mean_value_loss, mean_surrogate_loss, mean_kl_divergence = update_result
             else:
